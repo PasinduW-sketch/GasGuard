@@ -20,6 +20,10 @@
 #include <ESP32Servo.h>
 #include <HX711.h>
 #include <DHT.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "secrets.h"
+
 
 // ========== PIN DEFINITIONS ==========
 // Gas Sensor
@@ -86,6 +90,15 @@ float gasWeight = 0;
 float temperature = 0;
 float humidity = 0;
 float baselineGas = 0;
+int gasThreshold = GAS_THRESHOLD;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+bool firebaseReady = false;
+unsigned long lastFirebaseUpdate = 0;
+#define FIREBASE_UPDATE_DELAY 3000
 
 // Debounce timers
 unsigned long clearTime = 0;
@@ -93,10 +106,38 @@ unsigned long lastLCDUpdate = 0;
 unsigned long lastStatusPrint = 0;
 unsigned long lastSensorRead = 0;
 
+void initFirebase() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected");
+
+  config.api_key = FIREBASE_API_KEY;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase anonymous sign-in successful");
+    firebaseReady = true;
+  } else {
+    Serial.print("Firebase sign-in failed: ");
+    Serial.println(config.signer.signupError.message.c_str());
+    firebaseReady = false;
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
 // ========== SETUP ==========
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  initFirebase();
   
   Serial.println("\n╔══════════════════════════════════════════════════════════╗");
   Serial.println("║               SMARTGASML - GAS MONITORING SYSTEM        ║");
@@ -168,7 +209,7 @@ void printSystemInfo() {
   Serial.print("  LCD Address:       0x");
   Serial.println(LCD_ADDRESS, HEX);
   Serial.print("  Gas Threshold:     ");
-  Serial.println(GAS_THRESHOLD);
+ Serial.println(gasThreshold);
   Serial.println("  Commands: S=status, T=test, +=more sensitive, -=less sensitive");
   Serial.println("═══════════════════════════════════════════════════════════\n");
 }
@@ -231,7 +272,7 @@ void readAllSensors() {
 
 // ========== GAS DETECTION ==========
 bool checkForGas() {
-  return (gasLevel > GAS_THRESHOLD);
+  return (gasLevel > gasThreshold);
 }
 
 // ========== ALARM FUNCTIONS ==========
@@ -246,7 +287,7 @@ void activateAlarm() {
     Serial.print("   Gas Level: ");
     Serial.print(gasLevel);
     Serial.print(" (Threshold: ");
-    Serial.print(GAS_THRESHOLD);
+    Serial.print(gasThreshold);
     Serial.println(")");
     Serial.println("   Valve CLOSED - Gas supply shut off");
     
@@ -333,7 +374,7 @@ void updateLCD() {
     lcd.print("%");
     
     // Gas level bar graph
-    int barLength = map(gasLevel, 0, GAS_THRESHOLD * 1.5, 0, 8);
+   int barLength = map(gasLevel, 0, gasThreshold + (gasThreshold / 2), 0, 8);
     barLength = constrain(barLength, 0, 8);
     
     lcd.setCursor(12, 1);
@@ -422,13 +463,13 @@ void testAlarm() {
 
 // ========== ADJUST SENSITIVITY ==========
 void increaseSensitivity() {
-  gasThreshold = max(200, GAS_THRESHOLD - 50);
+ gasThreshold = max(200, gasThreshold - 50);
   Serial.print("⬆️ Increased sensitivity. New threshold: ");
   Serial.println(gasThreshold);
 }
 
 void decreaseSensitivity() {
-  gasThreshold = min(3500, GAS_THRESHOLD + 50);
+  gasThreshold = min(3500, gasThreshold + 50);
   Serial.print("⬇️ Decreased sensitivity. New threshold: ");
   Serial.println(gasThreshold);
 }
@@ -477,10 +518,83 @@ void closeValve() {
   lcd.print("Valve: CLOSED ");
 }
 
+void uploadStatsToFirestore() {
+  if (!firebaseReady || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastFirebaseUpdate < FIREBASE_UPDATE_DELAY) {
+    return;
+  }
+
+  lastFirebaseUpdate = currentTime;
+
+  double gasPercentage = (gasWeight / 5.0) * 100.0;
+  gasPercentage = constrain(gasPercentage, 0.0, 100.0);
+
+  double leakPercentage = 0.0;
+
+  if (gasLevel > gasThreshold) {
+    leakPercentage = 100.0;
+  } else {
+    leakPercentage = ((double)gasLevel / gasThreshold) * 100.0;
+  }
+
+  leakPercentage = constrain(leakPercentage, 0.0, 100.0);
+
+  long daysRemaining = 0;
+
+  if (gasWeight > 0 && gasWeight <= 5.0) {
+    daysRemaining = (long)(gasWeight / 0.12);
+  }
+
+  double estimatedCost = gasWeight * 382.0;
+
+  FirebaseJson content;
+
+  content.set("fields/unitId/stringValue", UNIT_ID);
+  content.set("fields/currentWeight/doubleValue", gasWeight);
+  content.set("fields/gasLevel/integerValue", gasLevel);
+  content.set("fields/gasPercentage/doubleValue", gasPercentage);
+  content.set("fields/leakDetected/booleanValue", gasDetected);
+  content.set("fields/leakPercentage/doubleValue", leakPercentage);
+  content.set("fields/systemStatus/stringValue", alarmActive ? "CRITICAL" : "NORMAL");
+  content.set("fields/temperature/doubleValue", temperature);
+  content.set("fields/valveClosed/booleanValue", alarmActive);
+  content.set("fields/dailyUsage/doubleValue", 0.12);
+  content.set("fields/daysRemaining/integerValue", daysRemaining);
+  content.set("fields/estimatedCost/doubleValue", estimatedCost);
+  content.set("fields/capacity/stringValue", "5kg");
+  content.set("fields/timestamp/stringValue", String(millis() / 1000));
+
+  String documentPath = "gas_stats/" + String(UNIT_ID);
+
+  String updateMask =
+    "unitId,currentWeight,gasLevel,gasPercentage,leakDetected,leakPercentage,"
+    "systemStatus,temperature,valveClosed,dailyUsage,daysRemaining,"
+    "estimatedCost,capacity,timestamp";
+
+  if (Firebase.Firestore.patchDocument(
+        &fbdo,
+        FIREBASE_PROJECT_ID,
+        "",
+        documentPath.c_str(),
+        content.raw(),
+        updateMask.c_str()
+      )) {
+    Serial.println("Firestore updated: " + documentPath);
+  } else {
+    Serial.print("Firestore update failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
 // ========== MAIN LOOP ==========
 void loop() {
   // Read all sensors
   readAllSensors();
+  uploadStatsToFirestore();
   
   // Check for gas
   bool currentGasDetected = checkForGas();
